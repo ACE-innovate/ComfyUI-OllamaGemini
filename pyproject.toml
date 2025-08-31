@@ -1,8 +1,8 @@
 [project]
 name = "comfyui-ollamagemini"
 description = "ComfyUI extension for Ollama, Gemini, OpenAI, Claude, and Qwen with video and audio support"
-version = "2.1"
-license = {file = "LICENSE"}
+version = "2.2"
+license = { file = "LICENSE" }
 dependencies = [
     "google-generativeai",
     "google-genai",
@@ -15,9 +15,9 @@ dependencies = [
     "Pillow>=10.0.0",
     "scipy>=1.10.0",
     "opencv-python>=4.6.0",
-    "transformers>=4.30.0",
+    "transformers==4.55.4",
     "torch",
-    "torchaudio"
+    "torchaudio",
 ]
 
 [project.urls]

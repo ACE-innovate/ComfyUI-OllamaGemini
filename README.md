@@ -35,6 +35,8 @@ https://github.com/user-attachments/assets/6ffba8bc-47e9-42c5-be98-5849ffb03547
   - **SDXL**: Premium tag-based prompts with precise artistic control, structured in order of importance
   - **FLUX.1-dev**: Hyper-detailed cinematographic prompts with technical precision and artistic vision
   - **VideoGen**: Professional video generation prompts with subject, context, action, cinematography, and style
+  - **Imagen4**: Structured, layered prompts optimized for Google's Imagen 4 model
+  - **GeminiNanaBananaEdit**: Conversational, mask-free image editing prompts for intuitive and precise modifications
 - AI-powered prompt enhancement with expert-level guidance
 - Returns only the enhanced prompt without additional commentary
 
