@@ -17,7 +17,7 @@ scipy # For gaussian_filter
 opencv-python # OpenCV for image processing
 
 # Machine learning
-transformers==4.55.4 # For CLIPSeg and BRIA_RMBG
+transformers # For CLIPSeg and BRIA_RMBG make it transformers==4.55.4 
 
 # For ComfyUI integration - these are usually provided by ComfyUI itself
 # torch
