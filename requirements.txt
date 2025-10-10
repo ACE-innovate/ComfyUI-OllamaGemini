@@ -1,26 +1,8 @@
 # API providers
 google-generativeai
-google-genai
 requests
 anthropic
-openai
-# For Qwen API
-dashscope
 
-# SVG conversion
-vtracer
-
-# Image processing
-numpy
+# Image processing (basic)
 Pillow
-scipy # For gaussian_filter
-opencv-python # OpenCV for image processing
-
-# Machine learning
-transformers # For CLIPSeg and BRIA_RMBG make it transformers==4.55.4 
-
-# For ComfyUI integration - these are usually provided by ComfyUI itself
-# torch
-# torchvision
-
-# Note: folder_paths is provided by ComfyUI
+numpy

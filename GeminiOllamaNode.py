@@ -1,41 +1,9 @@
 import os
-import json
+
 import google.generativeai as genai
 from PIL import Image
-import requests
 import torch
-import codecs
-from openai import OpenAI
-import base64
-import folder_paths
-import anthropic
-import io
 import numpy as np
-from .clipsegx import GeminiCLIPSeg, GeminiCombineSegMasks
-from .BRIA_RMBGx import GeminiBRIA_RMBG
-from .svgnodex import GeminiConvertRasterToVector, GeminiSaveSVG
-from .FLUXResolutions import GeminiFLUXResolutions
-from .prompt_stylerx import NODES
-
-# Try to import torchaudio for audio processing
-try:
-    import torchaudio
-    TORCHAUDIO_AVAILABLE = True
-except ImportError:
-    TORCHAUDIO_AVAILABLE = False
-    print("torchaudio not available. Audio processing will be limited.")
-
-# Note for users about audio processing dependencies
-"""
-For full audio processing support, especially for MP3 files, install these dependencies:
-1. torchaudio - Basic audio processing: pip install torchaudio
-2. ffmpeg - For converting audio formats: sudo apt-get install ffmpeg (Linux) or brew install ffmpeg (macOS)
-3. pydub - Alternative audio processing: pip install pydub
-
-If you encounter MP3 loading issues, make sure you have the necessary codecs:
-- Linux: sudo apt-get install libavcodec-extra
-- macOS: brew install ffmpeg --with-libvorbis --with-sdl2 --with-theora
-"""
 
 # Common function to apply prompt structure templates
 def apply_prompt_template(prompt, prompt_structure="Custom"):
@@ -91,15 +59,13 @@ def apply_prompt_template(prompt, prompt_structure="Custom"):
 
     return modified_prompt
 
-from datetime import datetime
-
-# ================== UNIVERSAL MEDIA UTILITIES ==================
 def rgba_to_rgb(image):
     """Convert RGBA image to RGB with white background"""
     if image.mode == 'RGBA':
         background = Image.new("RGB", image.size, (255, 255, 255))
         image = Image.alpha_composite(background.convert("RGBA"), image).convert("RGB")
     return image
+
 
 def tensor_to_pil_image(tensor):
     """Convert tensor to PIL Image with RGBA support"""
@@ -118,12 +84,6 @@ def tensor_to_pil_image(tensor):
     image = Image.fromarray(image_np, mode=mode)
     return rgba_to_rgb(image)
 
-def tensor_to_base64(tensor):
-    """Convert tensor to base64 encoded PNG"""
-    image = tensor_to_pil_image(tensor)
-    buffered = io.BytesIO()
-    image.save(buffered, format="PNG")
-    return base64.b64encode(buffered.getvalue()).decode()
 
 def sample_video_frames(video_tensor, num_samples=6):
     """Sample frames evenly from video tensor"""
@@ -141,641 +101,14 @@ def sample_video_frames(video_tensor, num_samples=6):
         frame = tensor_to_pil_image(video_tensor[idx])
         frames.append(frame)
     return frames
-
-def process_audio(audio_data, target_sample_rate=16000):
-    """Process audio data for API submission with robust error handling"""
-    if not TORCHAUDIO_AVAILABLE:
-        print("Warning: torchaudio not available, cannot process audio")
-        return None
-
-    try:
-        # Check if we received a path or a tensor
-        if isinstance(audio_data, str):
-            # It's a file path
-            try:
-                print(f"Loading audio from path: {audio_data}")
-                # Try to load with torchaudio
-                try:
-                    waveform, sample_rate = torchaudio.load(audio_data)
-                except RuntimeError as e:
-                    print(f"Error loading with torchaudio: {str(e)}")
-                    # If MP3 loading fails, try using alternative methods
-                    if audio_data.lower().endswith('.mp3'):
-                        print("Attempting to load MP3 with alternative method...")
-                        try:
-                            # Try to use ffmpeg if available
-                            import subprocess
-                            import tempfile
-
-                            # Create a temporary WAV file
-                            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
-                                temp_wav_path = temp_wav.name
-
-                            # Convert MP3 to WAV using ffmpeg
-                            cmd = ["ffmpeg", "-i", audio_data, "-ar", str(target_sample_rate), "-ac", "1", temp_wav_path]
-                            subprocess.run(cmd, check=True, capture_output=True)
-
-                            # Load the WAV file
-                            waveform, sample_rate = torchaudio.load(temp_wav_path)
-
-                            # Clean up
-                            os.remove(temp_wav_path)
-                            print("Successfully converted and loaded MP3 file")
-                        except Exception as ffmpeg_error:
-                            print(f"Failed to use ffmpeg: {str(ffmpeg_error)}")
-                            # If ffmpeg fails, try one more fallback
-                            try:
-                                from pydub import AudioSegment
-                                import numpy as np
-
-                                print("Attempting to load with pydub...")
-                                sound = AudioSegment.from_mp3(audio_data)
-                                sound = sound.set_frame_rate(target_sample_rate).set_channels(1)
-                                samples = np.array(sound.get_array_of_samples())
-                                waveform = torch.tensor(samples).float().div_(32768.0).unsqueeze(0)
-                                sample_rate = target_sample_rate
-                                print("Successfully loaded MP3 with pydub")
-                            except Exception as pydub_error:
-                                print(f"Failed to use pydub: {str(pydub_error)}")
-                                raise RuntimeError("All methods to load MP3 failed")
-                    else:
-                        # For non-MP3 files, re-raise the original error
-                        raise
-            except Exception as load_error:
-                print(f"All methods to load audio file failed: {str(load_error)}")
-                return None
-        else:
-            # It's a tensor or dictionary
-            try:
-                waveform = audio_data["waveform"]
-                sample_rate = audio_data["sample_rate"]
-            except (TypeError, KeyError):
-                # If it's just a tensor
-                if torch.is_tensor(audio_data):
-                    waveform = audio_data
-                    sample_rate = target_sample_rate  # Assume target sample rate
-                else:
-                    print(f"Unsupported audio data format: {type(audio_data)}")
-                    return None
-
-        # Handle different dimensions
-        if waveform.dim() == 3:  # [batch, channels, time]
-            waveform = waveform.squeeze(0)
-        elif waveform.dim() == 1:  # [time]
-            waveform = waveform.unsqueeze(0)
-
-        # Convert stereo to mono if needed
-        if waveform.shape[0] > 1:
-            waveform = torch.mean(waveform, dim=0, keepdim=True)
-
-        # Resample if needed
-        if sample_rate != target_sample_rate:
-            waveform = torchaudio.functional.resample(waveform, sample_rate, target_sample_rate)
-
-        # Normalize audio if needed
-        if waveform.abs().max() > 1.0:
-            waveform = waveform / waveform.abs().max()
-
-        # Convert to WAV format
-        buffer = io.BytesIO()
-        try:
-            torchaudio.save(buffer, waveform, target_sample_rate, format="WAV")
-            audio_bytes = buffer.getvalue()
-            return base64.b64encode(audio_bytes).decode('utf-8')
-        except Exception as save_error:
-            print(f"Error saving audio to buffer: {str(save_error)}")
-            return None
-
-    except Exception as e:
-        print(f"Error processing audio: {str(e)}")
-        return None
 def get_gemini_api_key():
-    try:
-        config_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'config.json')
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-        api_key = config["GEMINI_API_KEY"]
-    except:
-        print("Error: Gemini API key is required")
-        return ""
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        print("Error: GEMINI_API_KEY environment variable is required")
     return api_key
-
-def get_ollama_url():
-    try:
-        config_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'config.json')
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-        ollama_url = config.get("OLLAMA_URL", "http://localhost:11434")
-    except:
-        print("Error: Ollama URL not found, using default")
-        ollama_url = "http://localhost:11434"
-    return ollama_url
-
-def update_config_key(key, value):
-    config_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'config.json')
-    try:
-        # Read existing config
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        # If file doesn't exist or is empty/corrupt, start with a new dict
-        config = {}
-
-    # Update the key
-    config[key] = value
-
-    # Write the updated config back
-    try:
-        with open(config_path, 'w') as f:
-            json.dump(config, f, indent=4)
-        print(f"Successfully updated {key} in config.json")
-    except Exception as e:
-        print(f"Error writing to config.json: {str(e)}")
 
 # ================== API SERVICES ==================
 
-
-class GeminiQwenAPI:
-    def __init__(self):
-        self.qwen_api_key = self.get_qwen_api_key()
-        if not self.qwen_api_key:
-            print("Error: Qwen API key is required")
-        self.client = OpenAI(
-            api_key=self.qwen_api_key,
-            base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-        )
-
-    def get_qwen_api_key(self):
-        try:
-            config_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'config.json')
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-                return config.get("QWEN_API_KEY", "")
-        except Exception as e:
-            print(f"Error loading Qwen API key: {str(e)}")
-            return ""
-
-    def tensor_to_base64(self, image_tensor):
-        # Ensure the tensor is on CPU and convert to numpy
-        if torch.is_tensor(image_tensor):
-            if image_tensor.ndim == 4:
-                image_tensor = image_tensor[0]
-            image_tensor = (image_tensor * 255).clamp(0, 255)
-            image_tensor = image_tensor.cpu().numpy().astype(np.uint8)
-            if image_tensor.shape[0] == 3:  # If channels are first
-                image_tensor = image_tensor.transpose(1, 2, 0)
-
-        # Convert numpy array to PIL Image
-        image = Image.fromarray(image_tensor)
-
-        # Convert PIL Image to base64
-        buffered = io.BytesIO()
-        image.save(buffered, format="PNG")
-        img_str = base64.b64encode(buffered.getvalue()).decode()
-        return img_str
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "What is the meaning of life?", "multiline": True}),
-                "qwen_model": (
-                    [
-                        # Qwen Max/Plus/Turbo Models
-                        "qwen-max",
-                        "qwen-plus",
-                        "qwen-turbo",
-                        # Qwen Vision Models
-                        "qwen-vl-max",
-                        "qwen-vl-plus",
-                        # Qwen 1.5 Models
-                        "qwen1.5-32b-chat"
-                    ],
-                    {"default": "qwen-max"}
-                ),
-                "max_tokens": ("INT", {"default": 1024, "min": 1, "max": 8192, "step": 1}),
-                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.1}),
-                "top_p": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.1}),
-                "structure_output": ("BOOLEAN", {"default": False}),
-                "prompt_structure": ([
-                    "Custom",
-                    "HunyuanVideo",
-                    "Wan2.1",
-                    "FLUX.1-dev",
-                    "SDXL",
-                    "FLUXKontext",
-                    "Imagen4",
-                    "GeminiNanaBananaEdit"
-                ], {"default": "Custom"}),
-                "structure_format": ("STRING", {"default": "Return only the prompt text itself. No explanations or formatting.", "multiline": True}),
-                "output_format": ([
-                    "raw_text",
-                    "json"
-                ], {"default": "raw_text"}),
-            },
-            "optional": {
-                "api_key": ("STRING", {"default": "", "multiline": False}),
-                "image1": ("IMAGE",),
-                "image2": ("IMAGE",),
-                "image3": ("IMAGE",),
-                "image4": ("IMAGE",),
-                "image5": ("IMAGE",),
-            }
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("text",)
-    FUNCTION = "generate_content"
-    CATEGORY = "AI API/Qwen"
-
-    def generate_content(self, prompt, qwen_model, max_tokens, temperature, top_p, structure_output, prompt_structure, structure_format, output_format, api_key="", image1=None, image2=None, image3=None, image4=None, image5=None):
-        if api_key:
-            update_config_key("QWEN_API_KEY", api_key)
-            self.qwen_api_key = api_key
-            # Re-initialize the client with the new key
-            self.client = OpenAI(
-                api_key=self.qwen_api_key,
-                base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-            )
-
-        if not self.qwen_api_key:
-            return ("Qwen API key missing. Please provide it in the node's api_key input.",)
-
-        try:
-            # Apply prompt template
-            modified_prompt = apply_prompt_template(prompt, prompt_structure)
-
-            # Add structure format if requested
-            if structure_output:
-                print(f"Requesting structured output from {qwen_model}")
-                # Add the structure format to the prompt
-                modified_prompt = f"{modified_prompt}\n\n{structure_format}"
-                print(f"Modified prompt with structure format")
-
-            messages = [
-                {"role": "system", "content": "You are a helpful assistant."},
-            ]
-
-            # Handle multiple images
-            all_images = [image1, image2, image3, image4, image5]
-            provided_images = [img for img in all_images if img is not None]
-
-            if provided_images:
-                content = [{"type": "text", "text": modified_prompt}]
-                for img in provided_images:
-                    image_b64 = self.tensor_to_base64(img)
-                    content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}})
-                messages.append({"role": "user", "content": content})
-            else:
-                messages.append({"role": "user", "content": modified_prompt})
-
-            # Configure the request parameters
-            request_params = {
-                "model": qwen_model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "top_p": top_p
-            }
-
-            print(f"Sending request to Qwen API with model: {qwen_model}")
-            completion = self.client.chat.completions.create(**request_params)
-
-            # Get the response text
-            textoutput = completion.choices[0].message.content
-
-            # Process the output based on the selected format
-            if textoutput.strip():
-                # Clean up the text output
-                clean_text = textoutput.strip()
-
-                # Remove any markdown code blocks if present
-                if clean_text.startswith("```") and "```" in clean_text[3:]:
-                    first_block_end = clean_text.find("```", 3)
-                    if first_block_end > 3:
-                        # Extract content between the first set of backticks
-                        language_line_end = clean_text.find("\n", 3)
-                        if language_line_end > 3 and language_line_end < first_block_end:
-                            # Skip the language identifier line
-                            clean_text = clean_text[language_line_end+1:first_block_end].strip()
-                        else:
-                            clean_text = clean_text[3:first_block_end].strip()
-
-                # Remove any quotes around the text
-                if (clean_text.startswith('"') and clean_text.endswith('"')) or \
-                   (clean_text.startswith("'") and clean_text.endswith("'")):
-                    clean_text = clean_text[1:-1].strip()
-
-                # Remove any "Prompt:" or similar prefixes
-                prefixes_to_remove = ["Prompt:", "PROMPT:", "Generated Prompt:", "Final Prompt:"]
-                for prefix in prefixes_to_remove:
-                    if clean_text.startswith(prefix):
-                        clean_text = clean_text[len(prefix):].strip()
-                        break
-
-                # Format as JSON if requested
-                if output_format == "json":
-                    try:
-                        # Create a JSON object with the appropriate key based on the prompt structure
-                        key_name = "prompt"
-                        if prompt_structure != "Custom":
-                            key_name = f"{prompt_structure.lower().replace('.', '_').replace('-', '_')}_prompt"
-
-                        json_output = json.dumps({
-                            key_name: clean_text
-                        }, indent=2)
-
-                        print(f"Formatted output as JSON with key: {key_name}")
-                        textoutput = json_output
-                    except Exception as e:
-                        print(f"Error formatting output as JSON: {str(e)}")
-                else:
-                    # Just return the clean text
-                    textoutput = clean_text
-                    print("Returning raw text output")
-
-            return (textoutput,)
-
-        except Exception as e:
-            return (f"API Error: {str(e)}",)
-
-class GeminiOpenAIAPI:
-    def __init__(self):
-        self.openai_api_key = self.get_openai_api_key()
-        self.nvidia_api_key = self.get_nvidia_api_key()
-        if self.openai_api_key:
-            self.openai_client = OpenAI(api_key=self.openai_api_key)
-        if nvidia_api_key:
-            update_config_key("NVIDIA_API_KEY", nvidia_api_key)
-            self.nvidia_api_key = nvidia_api_key
-            self.nvidia_client = OpenAI(
-                base_url="https://integrate.api.nvidia.com/v1",
-                api_key=self.nvidia_api_key
-            )
-
-        # Apply prompt template
-        modified_prompt = apply_prompt_template(prompt, prompt_structure)
-
-        # Add structure format if requested
-        if structure_output:
-            print(f"Requesting structured output from {model}")
-            # Add the structure format to the prompt
-            modified_prompt = f"{modified_prompt}\n\n{structure_format}"
-            print(f"Modified prompt with structure format")
-
-        # Handle multiple images
-        all_images = [image1, image2, image3, image4, image5]
-        provided_images = [img for img in all_images if img is not None]
-
-        if provided_images:
-            content = [{"type": "text", "text": modified_prompt}]
-            for img in provided_images:
-                image_b64 = tensor_to_base64(img)
-                content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}})
-            messages = [{"role": "user", "content": content}]
-        else:
-            messages = [{"role": "user", "content": modified_prompt}]
-
-        try:
-            client = self.nvidia_client if model.startswith("deepseek") else self.openai_client
-            if not client:
-                raise ValueError("API client not initialized")
-
-            generation_params = {
-                "model": model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "top_p": top_p
-            }
-
-            if stream:
-                response = client.chat.completions.create(**generation_params, stream=True)
-                textoutput = "".join([chunk.choices[0].delta.content for chunk in response if chunk.choices[0].delta.content])
-            else:
-                response = client.chat.completions.create(**generation_params)
-                textoutput = response.choices[0].message.content
-
-                # Process the output based on the selected format
-                if textoutput.strip():
-                    # Clean up the text output
-                    clean_text = textoutput.strip()
-
-                    # Remove any markdown code blocks if present
-                    if clean_text.startswith("```") and "```" in clean_text[3:]:
-                        first_block_end = clean_text.find("```", 3)
-                        if first_block_end > 3:
-                            # Extract content between the first set of backticks
-                            language_line_end = clean_text.find("\n", 3)
-                            if language_line_end > 3 and language_line_end < first_block_end:
-                                # Skip the language identifier line
-                                clean_text = clean_text[language_line_end+1:first_block_end].strip()
-                            else:
-                                clean_text = clean_text[3:first_block_end].strip()
-
-                    # Remove any quotes around the text
-                    if (clean_text.startswith('"') and clean_text.endswith('"')) or \
-                       (clean_text.startswith("'") and clean_text.endswith("'")):
-                        clean_text = clean_text[1:-1].strip()
-
-                    # Remove any "Prompt:" or similar prefixes
-                    prefixes_to_remove = ["Prompt:", "PROMPT:", "Generated Prompt:", "Final Prompt:"]
-                    for prefix in prefixes_to_remove:
-                        if clean_text.startswith(prefix):
-                            clean_text = clean_text[len(prefix):].strip()
-                            break
-
-                    # Format as JSON if requested
-                    if output_format == "json":
-                        try:
-                            # Create a JSON object with the appropriate key based on the prompt structure
-                            key_name = "prompt"
-                            if prompt_structure != "Custom":
-                                key_name = f"{prompt_structure.lower().replace('.', '_').replace('-', '_')}_prompt"
-
-                            json_output = json.dumps({
-                                key_name: clean_text
-                            }, indent=2)
-
-                            print(f"Formatted output as JSON with key: {key_name}")
-                            textoutput = json_output
-                        except Exception as e:
-                            print(f"Error formatting output as JSON: {str(e)}")
-                    else:
-                        # Just return the clean text
-                        textoutput = clean_text
-                        print("Returning raw text output")
-
-            return (textoutput,)
-
-        except Exception as e:
-            return (f"API Error: {str(e)}",)
-
-class GeminiClaudeAPI:
-    def __init__(self):
-        self.claude_api_key = self.get_claude_api_key()
-        if self.claude_api_key:
-            self.client = anthropic.Client(api_key=self.claude_api_key)
-
-    def get_claude_api_key(self):
-        try:
-            config_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'config.json')
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-            return config["CLAUDE_API_KEY"]
-        except:
-            print("Error: Claude API key is required")
-            return ""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "What is the meaning of life?", "multiline": True}),
-                "model": ([
-                    # Most intelligent model
-                    "claude-3-7-sonnet-20250219",
-                    # Fastest model for daily tasks
-                    "claude-3-5-haiku-20241022",
-                    # Excels at writing and complex tasks
-                    "claude-3-opus-20240229",
-                    # Additional models
-                    "claude-3-5-sonnet-20241022",
-                    "claude-3-5-sonnet-20240620",
-                    "claude-3-haiku-20240307"
-                ],),
-                "max_tokens": ("INT", {"default": 1024, "min": 1, "max": 4096, "step": 1}),
-                "structure_output": ("BOOLEAN", {"default": False}),
-                "prompt_structure": ([
-                    "Custom",
-                    "HunyuanVideo",
-                    "Wan2.1",
-                    "FLUX.1-dev",
-                    "SDXL",
-                    "FLUXKontext",
-                    "Imagen4",
-                    "GeminiNanaBananaEdit"
-                ], {"default": "Custom"}),
-                "structure_format": ("STRING", {"default": "Return only the prompt text itself. No explanations or formatting.", "multiline": True}),
-                "output_format": ([
-                    "raw_text",
-                    "json"
-                ], {"default": "raw_text"}),
-            },
-            "optional": {
-                "api_key": ("STRING", {"default": "", "multiline": False}),
-                "image1": ("IMAGE",),
-                "image2": ("IMAGE",),
-                "image3": ("IMAGE",),
-                "image4": ("IMAGE",),
-                "image5": ("IMAGE",),
-            }
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("text",)
-    FUNCTION = "generate_content"
-    CATEGORY = "AI API/Claude"
-
-    def generate_content(self, prompt, model, max_tokens, structure_output, prompt_structure, structure_format, output_format, api_key="", image1=None, image2=None, image3=None, image4=None, image5=None):
-        if api_key:
-            update_config_key("CLAUDE_API_KEY", api_key)
-            self.claude_api_key = api_key
-            self.client = anthropic.Client(api_key=self.claude_api_key)
-
-        if not self.claude_api_key:
-            return ("Claude API key missing. Please provide it in the node's api_key input.",)
-
-        # Apply prompt template
-        modified_prompt = apply_prompt_template(prompt, prompt_structure)
-
-        # Add structure format if requested
-        if structure_output:
-            print(f"Requesting structured output from {model}")
-            # Add the structure format to the prompt
-            modified_prompt = f"{modified_prompt}\n\n{structure_format}"
-            print(f"Modified prompt with structure format")
-
-        # Handle multiple images
-        all_images = [image1, image2, image3, image4, image5]
-        provided_images = [img for img in all_images if img is not None]
-
-        if provided_images:
-            content = [{"type": "text", "text": modified_prompt}]
-            for img in provided_images:
-                image_b64 = tensor_to_base64(img)
-                content.append({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_b64}})
-            messages = [{"role": "user", "content": content}]
-        else:
-            messages = [{"role": "user", "content": modified_prompt}]
-
-        try:
-            # Configure the request parameters
-            request_params = {
-                "model": model,
-                "max_tokens": max_tokens,
-                "messages": messages
-            }
-
-            print(f"Sending request to Claude API with {len(messages)} messages")
-            response = self.client.messages.create(**request_params)
-
-            # Get the response text
-            textoutput = response.content[0].text
-
-            # Process the output based on the selected format
-            if textoutput.strip():
-                # Clean up the text output
-                clean_text = textoutput.strip()
-
-                # Remove any markdown code blocks if present
-                if clean_text.startswith("```") and "```" in clean_text[3:]:
-                    first_block_end = clean_text.find("```", 3)
-                    if first_block_end > 3:
-                        # Extract content between the first set of backticks
-                        language_line_end = clean_text.find("\n", 3)
-                        if language_line_end > 3 and language_line_end < first_block_end:
-                            # Skip the language identifier line
-                            clean_text = clean_text[language_line_end+1:first_block_end].strip()
-                        else:
-                            clean_text = clean_text[3:first_block_end].strip()
-
-                # Remove any quotes around the text
-                if (clean_text.startswith('"') and clean_text.endswith('"')) or \
-                   (clean_text.startswith("'") and clean_text.endswith("'")):
-                    clean_text = clean_text[1:-1].strip()
-
-                # Remove any "Prompt:" or similar prefixes
-                prefixes_to_remove = ["Prompt:", "PROMPT:", "Generated Prompt:", "Final Prompt:"]
-                for prefix in prefixes_to_remove:
-                    if clean_text.startswith(prefix):
-                        clean_text = clean_text[len(prefix):].strip()
-                        break
-
-                # Format as JSON if requested
-                if output_format == "json":
-                    try:
-                        # Create a JSON object with the appropriate key based on the prompt structure
-                        key_name = "prompt"
-                        if prompt_structure != "Custom":
-                            key_name = f"{prompt_structure.lower().replace('.', '_').replace('-', '_')}_prompt"
-
-                        json_output = json.dumps({
-                            key_name: clean_text
-                        }, indent=2)
-
-                        print(f"Formatted output as JSON with key: {key_name}")
-                        textoutput = json_output
-                    except Exception as e:
-                        print(f"Error formatting output as JSON: {str(e)}")
-                else:
-                    # Just return the clean text
-                    textoutput = clean_text
-                    print("Returning raw text output")
-
-            return (textoutput,)
-        except Exception as e:
-            return (f"API Error: {str(e)}",)
 
 class GeminiLLMAPI:
     def __init__(self):
@@ -783,9 +116,19 @@ class GeminiLLMAPI:
         if self.gemini_api_key:
             genai.configure(api_key=self.gemini_api_key, transport='rest')
 
-        # Import model list from list_models.py
-        from .list_models import get_gemini_models
-        self.available_models = get_gemini_models()
+        # Static Gemini model list (manually curated)
+        self.available_models = [
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-pro-exp-03-25",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-2.0-flash-exp-image-generation",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash",
+            "gemini-1.5-flash-8b",
+            "imagen-3.0-generate-002",
+        ]
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -796,7 +139,7 @@ class GeminiLLMAPI:
         return {
             "required": {
                 "prompt": ("STRING", {"default": "What is the meaning of life?", "multiline": True}),
-                "input_type": (["text", "image", "video", "audio"], {"default": "text"}),
+                "input_type": (["text", "image", "video"], {"default": "text"}),
                 "gemini_model": (available_models,),
                 "stream": ("BOOLEAN", {"default": False}),
                 "structure_output": ("BOOLEAN", {"default": False}),
@@ -823,7 +166,6 @@ class GeminiLLMAPI:
                 "image4": ("IMAGE",),
                 "image5": ("IMAGE",),
                 "video": ("IMAGE",),  # Video is represented as a tensor with shape [frames, height, width, channels]
-                "audio": ("AUDIO",),  # Audio input
             }
         }
 
@@ -832,24 +174,29 @@ class GeminiLLMAPI:
     FUNCTION = "generate_content"
     CATEGORY = "AI API/Gemini"
 
-    def generate_content(self, prompt, input_type, gemini_model, stream, structure_output, prompt_structure, structure_format, output_format, api_key="", image1=None, image2=None, image3=None, image4=None, image5=None, video=None, audio=None):
+    def generate_content(self, prompt, input_type, gemini_model, stream, structure_output, prompt_structure, structure_format, output_format, api_key="", image1=None, image2=None, image3=None, image4=None, image5=None, video=None):
         if api_key:
-            update_config_key("GEMINI_API_KEY", api_key)
             self.gemini_api_key = api_key
             genai.configure(api_key=self.gemini_api_key, transport='rest')
+        elif not self.gemini_api_key:
+            self.gemini_api_key = get_gemini_api_key()
+            if self.gemini_api_key:
+                genai.configure(api_key=self.gemini_api_key, transport='rest')
 
         if not self.gemini_api_key:
             return ("Gemini API key missing. Please provide it in the node's api_key input.",)
 
         try:
             generation_config = {"temperature": 0.7, "top_p": 0.8, "top_k": 40}
+            env_model_override = os.getenv("GEMINI_OLLAMA_MODEL")
+            current_model = env_model_override or gemini_model
             modified_prompt = apply_prompt_template(prompt, prompt_structure)
             if structure_output:
-                print(f"Requesting structured output from {gemini_model}")
+                print(f"Requesting structured output from {current_model}")
                 modified_prompt = f"{modified_prompt}\n\n{structure_format}"
                 print(f"Modified prompt with structure format")
 
-            model = genai.GenerativeModel(gemini_model)
+            model = genai.GenerativeModel(current_model)
 
             content = [modified_prompt]
 
@@ -868,9 +215,8 @@ class GeminiLLMAPI:
                     content.extend(frames)
                 else:
                     return ("Error: Could not extract frames from video",)
-            # Audio processing would go here if the modern library supported it this way
 
-            print(f"Sending request to Gemini API with model: {gemini_model}")
+            print(f"Sending request to Gemini API with model: {current_model}")
 
             safety_settings = [
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -934,355 +280,13 @@ class GeminiLLMAPI:
         except Exception as e:
             return (f"API Error: {str(e)}",)
 
-class GeminiOllamaAPI:
-    def __init__(self):
-        self.ollama_url = get_ollama_url()
-
-    @classmethod
-    def get_ollama_models(cls):
-        ollama_url = get_ollama_url()
-        try:
-            response = requests.get(f"{ollama_url}/api/tags")
-            if response.status_code == 200:
-                models = response.json().get('models', [])
-                return [model['name'] for model in models]
-            return ["llama2"]
-        except Exception as e:
-            print(f"Error fetching Ollama models: {str(e)}")
-            return ["llama2"]
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "What is the meaning of life?", "multiline": True}),
-                "input_type": (["text", "image", "video", "audio"], {"default": "text"}),
-                "ollama_model": (cls.get_ollama_models(),),
-                "keep_alive": ("INT", {"default": 0, "min": 0, "max": 60, "step": 1}),
-                "structure_output": ("BOOLEAN", {"default": False}),
-                "prompt_structure": ([
-                    "Custom",
-                    "VideoGen",
-                    "FLUX.1-dev",
-                    "SDXL",
-                    "FLUXKontext",
-                    "Imagen4",
-                    "GeminiNanaBananaEdit"
-                ], {"default": "Custom"}),
-                "structure_format": ("STRING", {"default": "Return only the prompt text itself. No explanations or formatting.", "multiline": True}),
-                "output_format": ([
-                    "raw_text",
-                    "json"
-                ], {"default": "raw_text"}),
-            },
-            "optional": {
-                "image1": ("IMAGE",),
-                "image2": ("IMAGE",),
-                "image3": ("IMAGE",),
-                "image4": ("IMAGE",),
-                "image5": ("IMAGE",),
-                "video": ("IMAGE",),  # Video is represented as a tensor with shape [frames, height, width, channels]
-                "audio": ("AUDIO",),  # Audio input
-            }
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("text",)
-    FUNCTION = "generate_content"
-    CATEGORY = "AI API/Ollama"
-
-    def generate_content(self, prompt, input_type, ollama_model, keep_alive, structure_output, prompt_structure, structure_format, output_format, image1=None, image2=None, image3=None, image4=None, image5=None, video=None, audio=None):
-        url = f"{self.ollama_url}/api/generate"
-
-        # Apply prompt template
-        modified_prompt = apply_prompt_template(prompt, prompt_structure)
-
-        # Add structure format if requested
-        if structure_output:
-            print(f"Requesting structured output from {ollama_model}")
-            # Add the structure format to the prompt
-            modified_prompt = f"{modified_prompt}\n\n{structure_format}"
-            print(f"Modified prompt with structure format")
-
-        payload = {
-            "model": ollama_model,
-            "prompt": modified_prompt,
-            "stream": False,
-            "keep_alive": f"{keep_alive}m"
-        }
-
-        try:
-            # Process different input types
-            if input_type == "text":
-                # Text-only input, no additional processing needed
-                print(f"Processing text input for Ollama API")
-
-            elif input_type == "image":
-                # Handle multiple images
-                all_images = [image1, image2, image3, image4, image5]
-                provided_images = [img for img in all_images if img is not None]
-
-                if provided_images:
-                    print(f"Processing {len(provided_images)} image(s) for Ollama API")
-                    image_data = []
-                    for img in provided_images:
-                        pil_image = tensor_to_pil_image(img)
-                        buffered = io.BytesIO()
-                        pil_image.save(buffered, format="PNG")
-                        image_data.append(base64.b64encode(buffered.getvalue()).decode())
-
-                    payload["images"] = image_data
-                    # Update prompt to indicate image analysis
-                    modified_prompt = f"Analyze these image(s): {modified_prompt}"
-                    payload["prompt"] = modified_prompt
-
-            elif input_type == "video" and video is not None:
-                # Process video input (extract frames)
-                print(f"Processing video input for Ollama API")
-                frames = sample_video_frames(video)
-                if frames:
-                    # Convert frames to base64
-                    frame_data = []
-                    for frame in frames:
-                        buffered = io.BytesIO()
-                        frame.save(buffered, format="PNG")
-                        frame_data.append(base64.b64encode(buffered.getvalue()).decode())
-
-                    # Add frames to payload
-                    payload["images"] = frame_data
-
-                    # Update prompt to indicate video analysis
-                    frame_count = len(frames)
-                    modified_prompt = f"Analyze these {frame_count} frames from a video: {modified_prompt}"
-                    payload["prompt"] = modified_prompt
-                else:
-                    print("Error: Could not extract frames from video")
-                    return ("Error: Could not extract frames from video",)
-
-            elif input_type == "audio" and audio is not None:
-                # Process audio input
-                print(f"Processing audio input for Ollama API")
-                if not TORCHAUDIO_AVAILABLE:
-                    return ("Error: torchaudio not available for audio processing",)
-
-                try:
-                    # Check different audio input formats
-                    if isinstance(audio, dict):
-                        if "path" in audio:
-                            # Direct path format
-                            audio_path = audio["path"]
-                            print(f"Processing audio from path: {audio_path}")
-                            audio_b64 = process_audio(audio_path)
-                        elif "waveform" in audio and "sample_rate" in audio:
-                            # ComfyUI audio node format
-                            print(f"Processing audio from waveform tensor")
-                            audio_b64 = process_audio(audio)
-                        else:
-                            # Unknown dictionary format
-                            print(f"Unknown audio dictionary format: {list(audio.keys())}")
-                            return ("Error: Unsupported audio format",)
-                    elif isinstance(audio, str) and os.path.exists(audio):
-                        # Direct file path
-                        print(f"Processing audio from direct path: {audio}")
-                        audio_b64 = process_audio(audio)
-                    else:
-                        # Try to process as tensor or other format
-                        print(f"Attempting to process audio as tensor")
-                        audio_b64 = process_audio(audio)
-
-                    if audio_b64:
-                        # Ollama doesn't directly support audio, so we'll include a note in the prompt
-                        modified_prompt = f"[This prompt includes audio data that has been processed] {modified_prompt}"
-                        payload["prompt"] = modified_prompt
-
-                        # Some Ollama models might support base64 encoded audio as an image
-                        # This is experimental and may not work with all models
-                        payload["images"] = [audio_b64]
-                    else:
-                        return ("Error: Failed to process audio data",)
-                except Exception as e:
-                    print(f"Error processing audio for Ollama: {str(e)}")
-                    return (f"Error processing audio: {str(e)}",)
-
-            # Send request to Ollama API
-            response = requests.post(url, json=payload)
-            response.raise_for_status()
-
-            # Get the response text
-            textoutput = response.json().get('response', '')
-
-            # Process the output based on the selected format
-            if textoutput.strip():
-                # Clean up the text output
-                clean_text = textoutput.strip()
-
-                # Remove any markdown code blocks if present
-                if clean_text.startswith("```") and "```" in clean_text[3:]:
-                    first_block_end = clean_text.find("```", 3)
-                    if first_block_end > 3:
-                        # Extract content between the first set of backticks
-                        language_line_end = clean_text.find("\n", 3)
-                        if language_line_end > 3 and language_line_end < first_block_end:
-                            # Skip the language identifier line
-                            clean_text = clean_text[language_line_end+1:first_block_end].strip()
-                        else:
-                            clean_text = clean_text[3:first_block_end].strip()
-
-                # Remove any quotes around the text
-                if (clean_text.startswith('"') and clean_text.endswith('"')) or \
-                   (clean_text.startswith("'") and clean_text.endswith("'")):
-                    clean_text = clean_text[1:-1].strip()
-
-                # Remove any "Prompt:" or similar prefixes
-                prefixes_to_remove = ["Prompt:", "PROMPT:", "Generated Prompt:", "Final Prompt:"]
-                for prefix in prefixes_to_remove:
-                    if clean_text.startswith(prefix):
-                        clean_text = clean_text[len(prefix):].strip()
-                        break
-
-                # Format as JSON if requested
-                if output_format == "json":
-                    try:
-                        # Create a JSON object with the appropriate key based on the prompt structure
-                        key_name = "prompt"
-                        if prompt_structure != "Custom":
-                            key_name = f"{prompt_structure.lower().replace('.', '_').replace('-', '_')}_prompt"
-
-                        json_output = json.dumps({
-                            key_name: clean_text
-                        }, indent=2)
-
-                        print(f"Formatted output as JSON with key: {key_name}")
-                        textoutput = json_output
-                    except Exception as e:
-                        print(f"Error formatting output as JSON: {str(e)}")
-                else:
-                    # Just return the clean text
-                    textoutput = clean_text
-                    print("Returning raw text output")
-
-            return (textoutput,)
-        except Exception as e:
-            return (f"API Error: {str(e)}",)
-
-# ================== SUPPORTING NODES ==================
-class GeminiTextSplitByDelimiter:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "text": ("STRING", {"multiline": True,"dynamicPrompts": False}),
-                "delimiter":("STRING", {"multiline": False,"default":",","dynamicPrompts": False}),
-                "start_index": ("INT", {"default": 0, "min": 0, "max": 1000}),
-                "skip_every": ("INT", {"default": 0, "min": 0, "max": 10}),
-                "max_count": ("INT", {"default": 10, "min": 1, "max": 1000}),
-            }
-        }
-
-    INPUT_IS_LIST = False
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "run"
-    OUTPUT_IS_LIST = (True,)
-    CATEGORY = "AI API"
-
-    def run(self, text, delimiter, start_index, skip_every, max_count):
-        delimiter = codecs.decode(delimiter, 'unicode_escape')
-        arr = [item.strip() for item in text.split(delimiter) if item.strip()]
-        arr = arr[start_index:start_index + max_count * (skip_every + 1):(skip_every + 1)]
-        return (arr,)
-
-
-
-class GeminiSaveTextFile:
-    def __init__(self):
-        self.output_dir = folder_paths.output_directory
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "filename": ("STRING", {"default": 'info', "multiline": False}),
-                "path": ("STRING", {"default": '', "multiline": False}),
-                "text": ("STRING", {"default": '', "multiline": True, "forceInput": True}),
-            }
-        }
-
-    OUTPUT_NODE = True
-    RETURN_TYPES = ()
-    FUNCTION = "save_text_file"
-    CATEGORY = "AI API"
-
-    def save_text_file(self, text="", path="", filename=""):
-        output_path = os.path.join(self.output_dir, path)
-        os.makedirs(output_path, exist_ok=True)
-
-        if not filename:
-            filename = datetime.now().strftime('%Y%m%d%H%M%S')
-
-        file_path = os.path.join(output_path, f"{filename}.txt")
-        try:
-            with open(file_path, 'w') as f:
-                f.write(text)
-        except OSError:
-            print(f'Error saving file: {file_path}')
-
-        return (text,)
-
-# Add a node to display available models
-class GeminiListAvailableModels:
-    def __init__(self):
-        pass
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "display_gemini": ("BOOLEAN", {"default": True}),
-                "display_openai": ("BOOLEAN", {"default": True})
-            }
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("model_list",)
-    FUNCTION = "list_models"
-    CATEGORY = "AI API/Utils"
-
-    def list_models(self, display_gemini, display_openai):
-        from .list_models import get_gemini_models, get_openai_models
-        model_list = []
-
-        if display_gemini:
-            gemini_models = get_gemini_models()
-            model_list.append("=== Gemini Models ===")
-            model_list.extend(gemini_models)
-            model_list.append("")
-
-        if display_openai:
-            openai_models = get_openai_models()
-            model_list.append("=== OpenAI Models ===")
-            model_list.extend(openai_models)
-
-        return ("\n".join(model_list),)
-
 # ================== NODE REGISTRATION ==================
 NODE_CLASS_MAPPINGS = {
     "GeminiAPI": GeminiLLMAPI,
-    "OllamaAPI": GeminiOllamaAPI,
-    "OpenAIAPI": GeminiOpenAIAPI,
-    "ClaudeAPI": GeminiClaudeAPI,
-    "QwenAPI": GeminiQwenAPI,
-    "GeminiTextSplitter": GeminiTextSplitByDelimiter,
-    "GeminiSaveText": GeminiSaveTextFile,
-    "ListAvailableModels": GeminiListAvailableModels,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "GeminiAPI": "Gemini API",
-    "OllamaAPI": "Ollama API",
-    "OpenAIAPI": "OpenAI API",
-    "ClaudeAPI": "Claude API",
-    "QwenAPI": "Qwen API",
-    "GeminiTextSplitter": "Gemini Text Splitter",
-    "GeminiSaveText": "Gemini Save Text",
-    "ListAvailableModels": "List Available Models",
 }
+
+__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
