@@ -1,4 +1,5 @@
 import os
+import json
 
 import google.generativeai as genai
 from PIL import Image
@@ -47,13 +48,11 @@ def apply_prompt_template(prompt, prompt_structure="Custom"):
     modified_prompt = prompt
     if prompt_structure != "Custom" and prompt_structure in prompt_templates:
         template = prompt_templates[prompt_structure]
-        print(f"Applying {prompt_structure} template")
         modified_prompt = f"{prompt}\n\n{template}"
     else:
         # Fallback to checking if prompt contains a template request
         for template_name, template in prompt_templates.items():
             if template_name.lower() in prompt.lower():
-                print(f"Detected {template_name} template request in prompt")
                 modified_prompt = f"{prompt}\n\n{template}"
                 break
 
@@ -118,8 +117,8 @@ class GeminiLLMAPI:
 
         # Static Gemini model list (manually curated)
         self.available_models = [
-            "gemini-2.5-flash",
             "gemini-2.5-flash-lite",
+            "gemini-2.5-flash",
             "gemini-2.5-pro-exp-03-25",
             "gemini-2.0-flash",
             "gemini-2.0-flash-lite",
@@ -130,17 +129,26 @@ class GeminiLLMAPI:
             "imagen-3.0-generate-002",
         ]
 
+        override_model = os.getenv("GEMINI_OLLAMA_MODEL", "").strip()
+        if override_model:
+            if override_model in self.available_models:
+                self.available_models.remove(override_model)
+            self.available_models.insert(0, override_model)
+
+        self.default_gemini_model = self.available_models[0]
+
     @classmethod
     def INPUT_TYPES(cls):
         # Create an instance to get the models
         instance = cls()
         available_models = instance.available_models
+        default_model = instance.default_gemini_model
 
         return {
             "required": {
                 "prompt": ("STRING", {"default": "What is the meaning of life?", "multiline": True}),
                 "input_type": (["text", "image", "video"], {"default": "text"}),
-                "gemini_model": (available_models,),
+                "gemini_model": (available_models, {"default": default_model}),
                 "stream": ("BOOLEAN", {"default": False}),
                 "structure_output": ("BOOLEAN", {"default": False}),
                 "prompt_structure": ([
@@ -188,13 +196,13 @@ class GeminiLLMAPI:
 
         try:
             generation_config = {"temperature": 0.7, "top_p": 0.8, "top_k": 40}
-            env_model_override = os.getenv("GEMINI_OLLAMA_MODEL")
+            env_model_override = os.getenv("GEMINI_OLLAMA_MODEL", "").strip()
+            if not env_model_override:
+                env_model_override = None
             current_model = env_model_override or gemini_model
             modified_prompt = apply_prompt_template(prompt, prompt_structure)
             if structure_output:
-                print(f"Requesting structured output from {current_model}")
                 modified_prompt = f"{modified_prompt}\n\n{structure_format}"
-                print(f"Modified prompt with structure format")
 
             model = genai.GenerativeModel(current_model)
 
@@ -216,7 +224,7 @@ class GeminiLLMAPI:
                 else:
                     return ("Error: Could not extract frames from video",)
 
-            print(f"Sending request to Gemini API with model: {current_model}")
+            print(f"Gemini model selected: {current_model}")
 
             safety_settings = [
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -242,8 +250,6 @@ class GeminiLLMAPI:
                         return (f"API Error: Empty response from Gemini API",)
                 textoutput = response.text
 
-            print("Gemini API response received successfully")
-
             if textoutput.strip():
                 clean_text = textoutput.strip()
                 if clean_text.startswith("```") and "```" in clean_text[3:]:
@@ -268,13 +274,11 @@ class GeminiLLMAPI:
                         if prompt_structure != "Custom":
                             key_name = f"{prompt_structure.lower().replace('.', '_').replace('-', '_')}_prompt"
                         json_output = json.dumps({key_name: clean_text}, indent=2)
-                        print(f"Formatted output as JSON with key: {key_name}")
                         textoutput = json_output
                     except Exception as e:
                         print(f"Error formatting output as JSON: {str(e)}")
                 else:
                     textoutput = clean_text
-                    print("Returning raw text output")
 
             return (textoutput,)
         except Exception as e:
