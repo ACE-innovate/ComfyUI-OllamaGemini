@@ -1,10 +1,21 @@
 import os
+
+from google import genai
+from PIL import Image
+import numpy as np
+import logging
 import json
 
-import google.generativeai as genai
-from PIL import Image
-import torch
-import numpy as np
+LOGGER_NAME = "COMFYUI_OLLAMA"
+logger = logging.getLogger(LOGGER_NAME)
+if not logger.handlers:
+    # Ensure we have a console handler even if Comfy didn't configure logging
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter(
+        "%(levelname)s %(name)s: %(message)s"
+    ))
+    logger.addHandler(_h)
+logger.setLevel(logging.DEBUG)
 
 # Common function to apply prompt structure templates
 def apply_prompt_template(prompt, prompt_structure="Custom"):
@@ -48,11 +59,13 @@ def apply_prompt_template(prompt, prompt_structure="Custom"):
     modified_prompt = prompt
     if prompt_structure != "Custom" and prompt_structure in prompt_templates:
         template = prompt_templates[prompt_structure]
+        logger.debug(f"Applying {prompt_structure} template")
         modified_prompt = f"{prompt}\n\n{template}"
     else:
         # Fallback to checking if prompt contains a template request
         for template_name, template in prompt_templates.items():
             if template_name.lower() in prompt.lower():
+                logger.debug(f"Detected {template_name} template request in prompt")
                 modified_prompt = f"{prompt}\n\n{template}"
                 break
 
@@ -68,8 +81,15 @@ def rgba_to_rgb(image):
 
 def tensor_to_pil_image(tensor):
     """Convert tensor to PIL Image with RGBA support"""
-    tensor = tensor.cpu()
-    image_np = tensor.squeeze().mul(255).clamp(0, 255).byte().numpy()
+    # Validate input is a tensor-like object
+    if not hasattr(tensor, 'cpu') or not hasattr(tensor, 'squeeze'):
+        raise Exception(f"Error: Expected tensor input, but got {type(tensor)}. Input must be a torch tensor or similar tensor object.")
+    
+    try:
+        tensor = tensor.cpu()
+        image_np = tensor.squeeze().mul(255).clamp(0, 255).byte().numpy()
+    except Exception as e:
+        raise Exception(f"Error converting tensor to numpy array: {str(e)}. Make sure the input is a valid image tensor.")
 
     # Handle different channel counts
     if len(image_np.shape) == 2:  # Grayscale
@@ -103,7 +123,7 @@ def sample_video_frames(video_tensor, num_samples=6):
 def get_gemini_api_key():
     api_key = os.getenv("GEMINI_API_KEY", "")
     if not api_key:
-        print("Error: GEMINI_API_KEY environment variable is required")
+        raise Exception("Error: GEMINI_API_KEY environment variable is required")
     return api_key
 
 # ================== API SERVICES ==================
@@ -112,13 +132,11 @@ def get_gemini_api_key():
 class GeminiLLMAPI:
     def __init__(self):
         self.gemini_api_key = get_gemini_api_key()
-        if self.gemini_api_key:
-            genai.configure(api_key=self.gemini_api_key, transport='rest')
 
         # Static Gemini model list (manually curated)
         self.available_models = [
-            "gemini-2.5-flash-lite",
             "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
             "gemini-2.5-pro-exp-03-25",
             "gemini-2.0-flash",
             "gemini-2.0-flash-lite",
@@ -129,26 +147,17 @@ class GeminiLLMAPI:
             "imagen-3.0-generate-002",
         ]
 
-        override_model = os.getenv("GEMINI_OLLAMA_MODEL", "").strip()
-        if override_model:
-            if override_model in self.available_models:
-                self.available_models.remove(override_model)
-            self.available_models.insert(0, override_model)
-
-        self.default_gemini_model = self.available_models[0]
-
     @classmethod
     def INPUT_TYPES(cls):
         # Create an instance to get the models
         instance = cls()
         available_models = instance.available_models
-        default_model = instance.default_gemini_model
 
         return {
             "required": {
                 "prompt": ("STRING", {"default": "What is the meaning of life?", "multiline": True}),
                 "input_type": (["text", "image", "video"], {"default": "text"}),
-                "gemini_model": (available_models, {"default": default_model}),
+                "gemini_model": (available_models,),
                 "stream": ("BOOLEAN", {"default": False}),
                 "structure_output": ("BOOLEAN", {"default": False}),
                 "prompt_structure": ([
@@ -183,28 +192,25 @@ class GeminiLLMAPI:
     CATEGORY = "AI API/Gemini"
 
     def generate_content(self, prompt, input_type, gemini_model, stream, structure_output, prompt_structure, structure_format, output_format, api_key="", image1=None, image2=None, image3=None, image4=None, image5=None, video=None):
+        logger.debug("Starting node...")
         if api_key:
             self.gemini_api_key = api_key
-            genai.configure(api_key=self.gemini_api_key, transport='rest')
         elif not self.gemini_api_key:
             self.gemini_api_key = get_gemini_api_key()
-            if self.gemini_api_key:
-                genai.configure(api_key=self.gemini_api_key, transport='rest')
 
         if not self.gemini_api_key:
-            return ("Gemini API key missing. Please provide it in the node's api_key input.",)
+            raise Exception("Gemini API key missing. Please provide it in the node's api_key input.")
 
+        genai_client = genai.Client(api_key=self.gemini_api_key)
+        
         try:
-            generation_config = {"temperature": 0.7, "top_p": 0.8, "top_k": 40}
-            env_model_override = os.getenv("GEMINI_OLLAMA_MODEL", "").strip()
-            if not env_model_override:
-                env_model_override = None
+            env_model_override = os.getenv("GEMINI_OLLAMA_MODEL")
             current_model = env_model_override or gemini_model
             modified_prompt = apply_prompt_template(prompt, prompt_structure)
             if structure_output:
+                logger.debug(f"Requesting structured output from {current_model}")
                 modified_prompt = f"{modified_prompt}\n\n{structure_format}"
-
-            model = genai.GenerativeModel(current_model)
+                logger.debug(f"Modified prompt with structure format")
 
             content = [modified_prompt]
 
@@ -215,6 +221,9 @@ class GeminiLLMAPI:
 
                 if provided_images:
                     for img in provided_images:
+                        # Validate that img is actually a tensor
+                        if not hasattr(img, 'cpu') or not hasattr(img, 'squeeze'):
+                            raise Exception(f"Error: Expected tensor input for image, but got {type(img)}. Make sure to connect an image tensor to the image input.")
                         pil_image = tensor_to_pil_image(img)
                         content.append(pil_image)
             elif input_type == "video" and video is not None:
@@ -222,33 +231,74 @@ class GeminiLLMAPI:
                 if frames:
                     content.extend(frames)
                 else:
-                    return ("Error: Could not extract frames from video",)
+                    raise Exception("Error: Could not extract frames from video")
 
-            print(f"Gemini model selected: {current_model}")
+            logger.debug(f"Sending request to Gemini API with model: {current_model}")
 
-            safety_settings = [
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-            ]
-
-            response = model.generate_content(
-                content,
-                generation_config=generation_config,
-                safety_settings=safety_settings,
-                stream=stream
+            config = genai.types.GenerateContentConfig(
+                temperature=0.7,
+                top_p=0.8,
+                top_k=40,
+                safety_settings=[
+                    genai.types.SafetySetting(category= "HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
+                    genai.types.SafetySetting(category= "HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
+                    genai.types.SafetySetting(category= "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
+                    genai.types.SafetySetting(category= "HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE")
+                ]
             )
+            
+            try:
+                response = genai_client.models.generate_content(
+                    model=current_model,
+                    contents=content,
+                    config=config
+                )
+            except genai.errors.APIError as e:
+                raise Exception(f"API Error - status: {e.code}, message: {e.message}")
+            
+            # Log response details for debugging
+            logger.debug(f"Response object type: {type(response)}")
+            logger.debug(f"Response attributes: {dir(response)}")
+            
+            textoutput = response.text
+            logger.debug(f"response.text value: {repr(textoutput)}")
+            logger.debug(f"response.text type: {type(textoutput)}")
 
-            if stream:
-                textoutput = "".join([chunk.text for chunk in response if hasattr(chunk, 'text')])
-            else:
-                if not hasattr(response, 'text'):
-                    if hasattr(response, 'prompt_feedback'):
-                        return (f"API Error: Content blocked - {response.prompt_feedback}",)
-                    else:
-                        return (f"API Error: Empty response from Gemini API",)
-                textoutput = response.text
+            if not textoutput:
+                # Log detailed response information for debugging
+                logger.warning("Empty response.text detected - investigating cause...")
+                
+                # Check various response attributes
+                if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                    logger.debug(f"prompt_feedback: {response.prompt_feedback}")
+                if hasattr(response, 'candidates') and response.candidates:
+                    logger.debug(f"candidates: {response.candidates}")
+                    if response.candidates:
+                        for i, candidate in enumerate(response.candidates):
+                            logger.debug(f"candidate[{i}]: {candidate}")
+                            if hasattr(candidate, 'finish_reason'):
+                                logger.debug(f"candidate[{i}].finish_reason: {candidate.finish_reason}")
+                            if hasattr(candidate, 'safety_ratings'):
+                                logger.debug(f"candidate[{i}].safety_ratings: {candidate.safety_ratings}")
+                            if hasattr(candidate, 'content'):
+                                logger.debug(f"candidate[{i}].content: {candidate.content}")
+                if hasattr(response, 'usage_metadata') and response.usage_metadata:
+                    logger.debug(f"usage_metadata: {response.usage_metadata}")
+                
+                # Check for specific blocking reasons
+                if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                    raise Exception(f"API Error: Content blocked - {response.prompt_feedback}")
+                elif hasattr(response, 'candidates') and response.candidates:
+                    candidate = response.candidates[0]
+                    if hasattr(candidate, 'finish_reason') and candidate.finish_reason:
+                        raise Exception(f"API Error: Content generation stopped - {candidate.finish_reason}")
+                    elif hasattr(candidate, 'safety_ratings') and candidate.safety_ratings:
+                        raise Exception(f"API Error: Content blocked by safety filters - {candidate.safety_ratings}")
+                else:
+                    raise Exception(f"API Error: Empty response from Gemini API - no candidates or feedback available")
+
+            logger.debug("Gemini API response received successfully")
+            logger.debug(f"Gemini API response: {textoutput}")
 
             if textoutput.strip():
                 clean_text = textoutput.strip()
@@ -274,15 +324,21 @@ class GeminiLLMAPI:
                         if prompt_structure != "Custom":
                             key_name = f"{prompt_structure.lower().replace('.', '_').replace('-', '_')}_prompt"
                         json_output = json.dumps({key_name: clean_text}, indent=2)
+                        logger.debug(f"Formatted output as JSON with key: {key_name}")
                         textoutput = json_output
                     except Exception as e:
-                        print(f"Error formatting output as JSON: {str(e)}")
+                        raise Exception(f"Error formatting output as JSON: {str(e)}")
                 else:
                     textoutput = clean_text
+                    logger.debug("Returning raw text output")
 
+            logger.debug(f"Formatted text output: {textoutput}")
+            
+            genai_client.close()
+            
             return (textoutput,)
         except Exception as e:
-            return (f"API Error: {str(e)}",)
+            raise Exception(f"Gemini API request failed: {str(e)}")
 
 # ================== NODE REGISTRATION ==================
 NODE_CLASS_MAPPINGS = {
