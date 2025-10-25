@@ -1,5 +1,5 @@
 # API providers
-google-generativeai
+google-genai
 requests
 anthropic
 
